@@ -2,7 +2,6 @@
 var cylinderTexture = require('./lib/cylinderTexture');
 var RayCurve = require('./lib/RayCurve');
 var parabolicCurve = require("./lib/ParabolicCurve");
-
 function easeIn(t){
   return t*t;
 }
