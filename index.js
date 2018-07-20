@@ -1,7 +1,26 @@
 /* global THREE, AFRAME, Element  */
 var cylinderTexture = require('./lib/cylinderTexture');
-var parabolicCurve = require('./lib/ParabolicCurve');
 var RayCurve = require('./lib/RayCurve');
+var parabolicCurve = require("./lib/ParabolicCurve");
+function easeIn(t){
+  return t*t;
+}
+
+function easeOutIn(t){
+  if (t < 0.5) return 0.5 * ( (t=t*2-1) * t * t + 1);
+  return 0.5*(t = t*2-1)*t*t + 0.5;
+}
+
+/**
+ * Check for the raycaster intersection
+ * based on whether the mesh collides with the raycaster
+ * @returns {boolean} true, if there's an intersection
+ */
+
+function isValidNormalsAngle(collisionNormal, referenceNormal, landingMaxAngle) {
+  var angleNormals = referenceNormal.angleTo(collisionNormal);
+  return (THREE.Math.RAD2DEG * angleNormals <= landingMaxAngle);
+}
 
 if (typeof AFRAME === 'undefined') {
   throw new Error('Component attempted to register before AFRAME was available.');
@@ -34,7 +53,9 @@ AFRAME.registerComponent('teleport-controls', {
     teleportOrigin: {type: 'selector'},
     hitCylinderColor: {type: 'color', default: '#99ff99'},
     hitCylinderRadius: {default: 0.25, min: 0},
+    outerRadius: {default: 0.6, min: 0},
     hitCylinderHeight: {default: 0.3, min: 0},
+    hitOuterTorusScale: {default: 2.5, min: 0.25},
     interval: {default: 0},
     maxLength: {default: 10, min: 0, if: {type: ['line']}},
     curveNumberPoints: {default: 30, min: 2, if: {type: ['parabolic']}},
@@ -47,16 +68,31 @@ AFRAME.registerComponent('teleport-controls', {
     landingMaxAngle: {default: '45', min: 0, max: 360},
     drawIncrementally: {default: false},
     incrementalDrawMs: {default: 700},
-    missOpacity: {default: 1.0},
-    hitOpacity: {default: 1.0}
+    missOpacity: {default: 0.1},
+    hitOpacity: {default: 0.3}
   },
+
+  checkLineIntersection: (function(){
+    const direction = new THREE.Vector3();
+    return function checkLineIntersection(start, end, meshes, raycaster, referenceNormal, landingMaxAngle, hitPoint) {
+      direction.copy(end).sub(start);
+      const distance = direction.length();
+      raycaster.far = distance;
+      raycaster.set(start, direction.normalize());
+      var intersects = raycaster.intersectObjects(meshes, true);
+      if (intersects.length > 0 && isValidNormalsAngle(intersects[0].face.normal, referenceNormal, landingMaxAngle)) {
+        hitPoint.copy(intersects[0].point);
+        return true;
+      }
+      return false;
+    };
+  })(),
 
   init: function () {
     var data = this.data;
     var el = this.el;
     var teleportEntity;
     var i;
-
     this.active = false;
     this.obj = el.object3D;
     this.hitPoint = new THREE.Vector3();
@@ -71,11 +107,14 @@ AFRAME.registerComponent('teleport-controls', {
     this.hit = false;
     this.prevCheckTime = undefined;
     this.prevHitHeight = 0;
+    this.prevCheckTime = 0;
+    this.currentCollidedIndex = 0;
     this.referenceNormal = new THREE.Vector3();
     this.curveMissColor = new THREE.Color();
     this.curveHitColor = new THREE.Color();
     this.raycaster = new THREE.Raycaster();
 
+    this.parabola = Array.from(new Array(data.curveNumberPoints), () => new THREE.Vector3());
     this.defaultPlane = createDefaultPlane(this.data.defaultPlaneSize);
     this.defaultCollisionMeshes = [this.defaultPlane];
 
@@ -121,7 +160,7 @@ AFRAME.registerComponent('teleport-controls', {
       this.line = createLine(data);
       this.line.material.opacity = this.data.hitOpacity;
       this.line.material.transparent = this.data.hitOpacity < 1;
-      this.numActivePoints = data.curveNumberPoints;
+      this.timeSinceDrawStart = 0;
       this.teleportEntity.setObject3D('mesh', this.line.mesh);
     }
 
@@ -129,15 +168,18 @@ AFRAME.registerComponent('teleport-controls', {
     if (data.hitEntity) {
       this.hitEntity = data.hitEntity;
     } else if (!this.hitEntity || 'hitCylinderColor' in diff || 'hitCylinderHeight' in diff ||
-               'hitCylinderRadius' in diff) {
+               'hitCylinderRadius' in diff || 'outerRadius' in diff) {
       // Remove previous entity, create new entity (could be more performant).
       if (this.hitEntity) { this.hitEntity.parentNode.removeChild(this.hitEntity); }
-      this.hitEntity = createHitEntity(data);
+      this.hitEntity = this.createHitEntity(data);
       this.el.sceneEl.appendChild(this.hitEntity);
     }
     this.hitEntity.setAttribute('visible', false);
 
     if ('collisionEntities' in diff) { this.queryCollisionEntities(); }
+    if ('curveNumberPoints' in diff) {
+      this.parabola = Array.from(new Array(data.curveNumberPoints), () => new THREE.Vector3());
+    }
   },
 
   remove: function () {
@@ -155,15 +197,12 @@ AFRAME.registerComponent('teleport-controls', {
   tick: (function () {
     var p0 = new THREE.Vector3();
     var v0 = new THREE.Vector3();
-    var g = -9.8;
-    var a = new THREE.Vector3(0, g, 0);
-    var next = new THREE.Vector3();
-    var last = new THREE.Vector3();
+    var halfA = new THREE.Vector3(0, -9.8/2, 0);
+    var point = new THREE.Vector3();
     var quaternion = new THREE.Quaternion();
     var translation = new THREE.Vector3();
     var scale = new THREE.Vector3();
     var shootAngle = new THREE.Vector3();
-    var lastNext = new THREE.Vector3();
     var auxDirection = new THREE.Vector3();
     var timeSinceDrawStart = 0;
 
@@ -174,15 +213,12 @@ AFRAME.registerComponent('teleport-controls', {
         timeSinceDrawStart = 0;
       }
       timeSinceDrawStart += delta;
-      this.numActivePoints = this.data.curveNumberPoints*timeSinceDrawStart/this.data.incrementalDrawMs;
-      if (this.numActivePoints > this.data.curveNumberPoints){
-        this.numActivePoints = this.data.curveNumberPoints;
+      this.timeSinceDrawStart = timeSinceDrawStart;
+      if (this.timeSinceDrawStart > this.data.incrementalDrawMs || !this.data.drawIncrementally) {
+        this.timeSinceDrawStart = this.data.incrementalDrawMs;
       }
-
-      // Only check for intersection if interval time has passed.
-      if (this.prevCheckTime && (time - this.prevCheckTime < this.data.interval)) { return; }
-      // Update check time.
-      this.prevCheckTime = time;
+      const percentToDraw = this.timeSinceDrawStart / this.data.incrementalDrawMs;
+      let isPrevCheckTimeOverInterval = (time - this.prevCheckTime) > this.data.interval;
 
       var matrixWorld = this.obj.matrixWorld;
       matrixWorld.decompose(translation, quaternion, scale);
@@ -192,51 +228,73 @@ AFRAME.registerComponent('teleport-controls', {
       this.line.setDirection(auxDirection.copy(direction));
       this.obj.getWorldPosition(p0);
 
-      last.copy(p0);
-
-      // Set default status as non-hit
       this.teleportEntity.setAttribute('visible', true);
-      this.line.material.color.set(this.curveMissColor);
-      this.line.material.opacity = this.data.missOpacity;
-      this.line.material.transparent = this.data.missOpacity < 1;
-      this.hitEntity.setAttribute('visible', false);
-      this.hit = false;
+      const numPoints = this.parabola.length;
 
       if (this.data.type === 'parabolic') {
-        v0.copy(direction).multiplyScalar(this.data.curveShootingSpeed);
+        // Only check for intersection if interval time has passed.
+        if (isPrevCheckTimeOverInterval) {
+          this.hit = false;
+          this.currentCollidedIndex = numPoints - 1;
+          v0.copy(direction).multiplyScalar(this.data.curveShootingSpeed);
+          const timeSegment = 1 / (numPoints-1);
+          this.parabola[0].copy(p0);
 
-        this.lastDrawnIndex = 0;
-        const numPoints = this.data.drawIncrementally ? this.numActivePoints : this.line.numPoints;
-        for (var i = 0; i < numPoints+1; i++) {
-          var t;
-          if (i == Math.floor(numPoints+1)){
-            t =  numPoints / (this.line.numPoints - 1);
+          for (let i = 1; i < numPoints; i++) {
+            let t = i * timeSegment;
+            parabolicCurve(p0, v0, halfA, t, point);
+            this.parabola[i].copy(point);
+
+            if (this.checkLineIntersection(this.parabola[i-1], this.parabola[i], this.meshes, this.raycaster, this.referenceNormal, this.data.landingMaxAngle, this.hitPoint)) {
+              this.hit = true;
+              this.currentCollidedIndex = i;
+              break;
+            }
           }
-          else {
-            t = i / (this.line.numPoints - 1);
-          }
-          parabolicCurve(p0, v0, a, t, next);
-          // Update the raycaster with the length of the current segment last->next
-          var dirLastNext = lastNext.copy(next).sub(last).normalize();
-          this.raycaster.far = dirLastNext.length();
-          this.raycaster.set(last, dirLastNext);
-
-          this.lastDrawnPoint = next;
-          this.lastDrawnIndex = i;
-          if (this.checkMeshCollisions(i, next)) { break; }
-
-          last.copy(next);
+          this.prevCheckTime = time;
         }
-        for (var j = this.lastDrawnIndex+1; j < this.line.numPoints; j++) {
-          this.line.setPoint(j, this.lastDrawnPoint);
+        /** percentRaycasted: the final parabolic curve we use, which might not be the whole parabolic line we calculate above.
+         * percentToDraw: it decides the porpotion of the line we are drawing out at this time frame.
+        */
+        const percentRaycasted = this.currentCollidedIndex / (numPoints-1);
+        const segmentT = percentToDraw*percentRaycasted / (numPoints-1);
+        for (let i = 0; i < numPoints; i++) {
+          const t = i*segmentT;
+          parabolicCurve(p0, v0, halfA, t, point);
+          this.line.setPoint(i, point);
         }
       } else if (this.data.type === 'line') {
-        next.copy(last).add(auxDirection.copy(direction).multiplyScalar(this.data.maxLength));
         this.raycaster.far = this.data.maxLength;
         this.raycaster.set(p0, direction);
+        if (isPrevCheckTimeOverInterval) {
+          this.hit = false;
+          point.copy(p0).add(auxDirection.copy(direction).multiplyScalar(this.data.maxLength));
+          if (this.checkLineIntersection(p0, point, this.meshes, this.raycaster, this.referenceNormal, this.data.landingMaxAngle,  this.hitPoint)) {
+            this.currentCollidedIndex = 1;
+            this.hit = true;
+          }
+        }
         this.line.setPoint(0, p0);
+        const distance = p0.distanceTo(this.hit? this.hitPoint : point);
+        point.copy(p0).add(auxDirection.copy(direction).multiplyScalar(percentToDraw * distance));
+        this.line.setPoint(1, point);
+      }
 
-        this.checkMeshCollisions(1, next);
+      const color = this.hit ? this.curveHitColor : this.curveMissColor;
+      const opacity = this.hit && this.timeSinceDrawStart === this.data.incrementalDrawMs ? this.data.hitOpacity : this.data.missOpacity;
+      const transparent = opacity < 1;
+      this.line.material.color.set(color);
+      this.line.material.opacity = opacity;
+      this.line.material.transparent = transparent;
+      this.hitEntity.setAttribute('visible', this.hit);
+      if (this.hit) {
+        this.hitEntity.setAttribute('position', this.hitPoint);
+        const hitEntityOpacity = this.data.hitOpacity*easeOutIn(percentToDraw);
+        const dRadii = this.data.outerRadius - this.data.hitCylinderRadius;
+        const outerScale = (this.data.outerRadius - easeIn(percentToDraw)*dRadii) / this.data.outerRadius;
+        this.outerTorus.object3D.scale.set(outerScale, outerScale, 1);
+        this.torus.setAttribute('material', 'opacity', hitEntityOpacity);
+        this.cylinder.setAttribute('material', 'opacity', hitEntityOpacity);
       }
     };
   })(),
@@ -247,6 +305,8 @@ AFRAME.registerComponent('teleport-controls', {
    */
   queryCollisionEntities: function () {
     var collisionEntities;
+    var meshes;
+    var defaultCollisionMeshes;
     var data = this.data;
     var el = this.el;
 
@@ -257,11 +317,26 @@ AFRAME.registerComponent('teleport-controls', {
 
     collisionEntities = [].slice.call(el.sceneEl.querySelectorAll(data.collisionEntities));
     this.collisionEntities = collisionEntities;
+    defaultCollisionMeshes = this.defaultCollisionMeshes;
+    if (!this.data.collisionEntities) {
+      meshes = this.defaultCollisionMeshes;
+    } else {
+      meshes = getMeshes(this.collisionEntities, defaultCollisionMeshes);
+    }
+    this.meshes = meshes;
 
+    if (this.childAttachHandler) {
+      el.sceneEl.removeEventListener('child-attached', this.childAttachHandler);
+    }
+    if (this.childDetachHandler) {
+      el.sceneEl.removeEventListener('child-detached', this.childDetachHandler);
+    }
     // Update entity list on attach.
     this.childAttachHandler = function childAttachHandler (evt) {
       if (!evt.detail.el.matches(data.collisionEntities)) { return; }
       collisionEntities.push(evt.detail.el);
+      meshes = getMeshes(collisionEntities, defaultCollisionMeshes);
+
     };
     el.sceneEl.addEventListener('child-attached', this.childAttachHandler);
 
@@ -272,6 +347,7 @@ AFRAME.registerComponent('teleport-controls', {
       index = collisionEntities.indexOf(evt.detail.el);
       if (index === -1) { return; }
       collisionEntities.splice(index, 1);
+      meshes = getMeshes(collisionEntities, defaultCollisionMeshes);
     };
     el.sceneEl.addEventListener('child-detached', this.childDetachHandler);
   },
@@ -293,7 +369,6 @@ AFRAME.registerComponent('teleport-controls', {
     return function (evt) {
       if (!this.active) { return; }
 
-      // Hide the hit point and the curve
       this.active = false;
       this.hitEntity.setAttribute('visible', false);
       this.teleportEntity.setAttribute('visible', false);
@@ -302,6 +377,9 @@ AFRAME.registerComponent('teleport-controls', {
         // Button released but not hit point
         return;
       }
+
+      // button released before the teleport animation finishes
+      if (this.hit && this.timeSinceDrawStart < this.data.incrementalDrawMs) { return; }
 
       const rig = this.data.cameraRig || this.el.sceneEl.camera.el;
       rig.object3D.getWorldPosition(this.rigWorldPosition);
@@ -331,8 +409,6 @@ AFRAME.registerComponent('teleport-controls', {
         for (var i = 0; i < hands.length; i++) {
           hands[i].object3D.getWorldPosition(handPosition);
 
-          // diff = rigWorldPosition - handPosition
-          // newPos = newRigWorldPosition - diff
           newHandPosition[i].copy(this.newRigWorldPosition).sub(this.rigWorldPosition).add(handPosition);
           hands[i].setAttribute('position', newHandPosition[i]);
         }
@@ -343,114 +419,87 @@ AFRAME.registerComponent('teleport-controls', {
   })(),
 
   /**
-   * Check for raycaster intersection.
-   *
-   * @param {number} Line fragment point index.
-   * @param {number} Next line fragment point index.
-   * @returns {boolean} true if there's an intersection.
+   * Create mesh to represent the area of intersection.
+   * Default to a combination of torus and cylinder.
    */
-  checkMeshCollisions: function (i, next) {
-    // @todo We should add a property to define if the collisionEntity is dynamic or static
-    // If static we should do the map just once, otherwise we're recreating the array in every
-    // loop when aiming.
-    var meshes;
-    if (!this.data.collisionEntities) {
-      meshes = this.defaultCollisionMeshes;
-    } else {
-      meshes = this.collisionEntities.map(function (entity) {
-        return entity.getObject3D('mesh');
-      }).filter(function (n) { return n; });
-      meshes = meshes.length ? meshes : this.defaultCollisionMeshes;
-    }
+  createHitEntity (data) {
+    var hitEntity;
 
-    var intersects = this.raycaster.intersectObjects(meshes, true);
-    if (intersects.length > 0 && !this.hit &&
-        this.isValidNormalsAngle(intersects[0].face.normal)) {
-      var point = intersects[0].point;
+    // Parent.
+    hitEntity = document.createElement('a-entity');
+    hitEntity.className = 'hitEntity';
 
-      this.line.material.color.set(this.curveHitColor);
-      this.line.material.opacity = this.data.hitOpacity;
-      this.line.material.transparent= this.data.hitOpacity < 1;
-      this.hitEntity.setAttribute('position', point);
-      this.hitEntity.setAttribute('visible', true);
+    // Torus.
+    this.torus = document.createElement('a-entity');
+    this.torus.setAttribute('geometry', {
+      primitive: 'torus',
+      radius: data.hitCylinderRadius,
+      radiusTubular: 0.01
+    });
+    this.torus.setAttribute('rotation', {x: 90, y: 0, z: 0});
+    this.torus.setAttribute('material', {
+      shader: 'flat',
+      color: data.hitCylinderColor,
+      side: 'double',
+      depthTest: false
+    });
+    hitEntity.appendChild(this.torus);
 
-      this.hit = true;
-      this.hitPoint.copy(intersects[0].point);
+    // Cylinder.
+    this.cylinder = document.createElement('a-entity');
+    this.cylinder.setAttribute('position', {x: 0, y: data.hitCylinderHeight / 2, z: 0});
+    this.cylinder.setAttribute('geometry', {
+      primitive: 'cylinder',
+      segmentsHeight: 1,
+      radius: data.hitCylinderRadius,
+      height: data.hitCylinderHeight,
+      openEnded: true
+    });
+    this.cylinder.setAttribute('material', {
+      shader: 'flat',
+      color: data.hitCylinderColor,
+      side: 'double',
+      src: cylinderTexture,
+      transparent: true,
+      depthTest: false
+    });
+    hitEntity.appendChild(this.cylinder);
 
-      // If hit, just fill the rest of the points with the hit point and break the loop
-      for (var j = i; j < this.line.numPoints; j++) {
-        this.line.setPoint(j, this.hitPoint);
-      }
-      return true;
-    } else {
-      this.line.setPoint(i, next);
-      return false;
-    }
-  },
+    // create another torus for animating when the hit destination is ready to go
+    this.outerTorus = document.createElement('a-entity');
+    this.outerTorus.setAttribute('geometry', {
+      primitive: 'torus',
+      radius: data.outerRadius,
+      radiusTubular: 0.01
+    });
+    this.outerTorus.setAttribute('rotation', {x: 90, y: 0, z: 0});
+    this.outerTorus.setAttribute('material', {
+      shader: 'flat',
+      color: data.hitCylinderColor,
+      side: 'double',
+      opacity: data.hitOpacity,
+      depthTest: false
+    });
+    this.outerTorus.setAttribute('id', 'outerTorus');
+    hitEntity.appendChild(this.outerTorus);
 
-  isValidNormalsAngle: function (collisionNormal) {
-    var angleNormals = this.referenceNormal.angleTo(collisionNormal);
-    return (THREE.Math.RAD2DEG * angleNormals <= this.data.landingMaxAngle);
-  },
+    return hitEntity;
+  }
 });
 
+function getMeshes (collisionEntities, defaultCollisionMeshes) {
+  var meshes = collisionEntities.map(function (entity) {
+    return entity.getObject3D('mesh');
+  }).filter(function (n) { return n; });
+  meshes = meshes.length ? meshes : defaultCollisionMeshes;
+  return meshes;
+}
 
 function createLine (data) {
   var numPoints = data.type === 'line' ? 2 : data.curveNumberPoints;
   return new RayCurve(numPoints, data.curveLineWidth);
 }
 
-/**
- * Create mesh to represent the area of intersection.
- * Default to a combination of torus and cylinder.
- */
-function createHitEntity (data) {
-  var cylinder;
-  var hitEntity;
-  var torus;
-
-  // Parent.
-  hitEntity = document.createElement('a-entity');
-  hitEntity.className = 'hitEntity';
-
-  // Torus.
-  torus = document.createElement('a-entity');
-  torus.setAttribute('geometry', {
-    primitive: 'torus',
-    radius: data.hitCylinderRadius,
-    radiusTubular: 0.01
-  });
-  torus.setAttribute('rotation', {x: 90, y: 0, z: 0});
-  torus.setAttribute('material', {
-    shader: 'flat',
-    color: data.hitCylinderColor,
-    side: 'double',
-    depthTest: false
-  });
-  hitEntity.appendChild(torus);
-
-  // Cylinder.
-  cylinder = document.createElement('a-entity');
-  cylinder.setAttribute('position', {x: 0, y: data.hitCylinderHeight / 2, z: 0});
-  cylinder.setAttribute('geometry', {
-    primitive: 'cylinder',
-    segmentsHeight: 1,
-    radius: data.hitCylinderRadius,
-    height: data.hitCylinderHeight,
-    openEnded: true
-  });
-  cylinder.setAttribute('material', {
-    shader: 'flat',
-    color: data.hitCylinderColor,
-    side: 'double',
-    src: cylinderTexture,
-    transparent: true,
-    depthTest: false
-  });
-  hitEntity.appendChild(cylinder);
-
-  return hitEntity;
-}
 
 function createDefaultPlane (size) {
   var geometry;
