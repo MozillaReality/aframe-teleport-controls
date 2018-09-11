@@ -434,7 +434,9 @@ AFRAME.registerComponent('teleport-controls', {
     this.torus.setAttribute('geometry', {
       primitive: 'torus',
       radius: data.hitCylinderRadius,
-      radiusTubular: 0.01
+      radiusTubular: 0.01,
+      segmentsRadial: 8,
+      tubularSegments: 6
     });
     this.torus.setAttribute('rotation', {x: 90, y: 0, z: 0});
     this.torus.setAttribute('material', {
@@ -470,7 +472,9 @@ AFRAME.registerComponent('teleport-controls', {
     this.outerTorus.setAttribute('geometry', {
       primitive: 'torus',
       radius: data.outerRadius,
-      radiusTubular: 0.01
+      radiusTubular: 0.01,
+      segmentsRadial: 8,
+      tubularSegments: 6
     });
     this.outerTorus.setAttribute('rotation', {x: 90, y: 0, z: 0});
     this.outerTorus.setAttribute('material', {
